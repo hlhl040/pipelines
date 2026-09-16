@@ -56,6 +56,8 @@ const DefaultTokenReviewAudience string = "pipelines.kubeflow.org"
 
 const DefaultMetadataTLSEnabled = false
 
+const DefaultDBCredentialProviderEnabled = false
+
 const (
 	DefaultPipelineRunnerServiceAccount = "pipeline-runner"
 	HasDefaultBucketEnvVar              = "HAS_DEFAULT_BUCKET"
