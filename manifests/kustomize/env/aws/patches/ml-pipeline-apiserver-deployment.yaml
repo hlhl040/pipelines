@@ -1,0 +1,26 @@
+# Mount the database CA bundle so the API server can verify the RDS server
+# certificate. IAM authentication sends the token using the cleartext password
+# plugin, so the API server refuses to start without this.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-pipeline
+spec:
+  template:
+    spec:
+      containers:
+      - name: ml-pipeline-api-server
+        env:
+        - name: DBCONFIG_MYSQLCONFIG_USER
+          valueFrom:
+            secretKeyRef:
+              name: kfp-db-users
+              key: apiserverUser
+        volumeMounts:
+        - name: db-ca-bundle
+          mountPath: /etc/db-tls
+          readOnly: true
+      volumes:
+      - name: db-ca-bundle
+        configMap:
+          name: db-ca-bundle
