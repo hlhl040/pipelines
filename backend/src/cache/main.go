@@ -21,8 +21,11 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/kubeflow/pipelines/backend/src/cache/server"
+	_ "github.com/kubeflow/pipelines/backend/src/common/dbcreds/all"
 	"github.com/kubeflow/pipelines/backend/src/common/util"
 )
 
@@ -56,6 +59,12 @@ type WhSvrDBParameters struct {
 	dbGroupConcatMaxLen string
 	dbExtraParams       string
 	namespaceToWatch    string
+
+	// dbProviderEnabled holds the raw flag value; use providerEnabled to read it.
+	dbProviderEnabled    string
+	dbCredentialProvider string
+	dbProviderSettings   string
+	dbTLSCAPath          string
 }
 
 func main() {
@@ -74,6 +83,10 @@ func main() {
 	flag.StringVar(&params.dbGroupConcatMaxLen, "db_group_concat_max_len", mysqlDBGroupConcatMaxLenDefault, "Database group concat max length.")
 	flag.StringVar(&params.dbExtraParams, "db_extra_params", "", "Database extra parameters.")
 	flag.StringVar(&params.namespaceToWatch, "namespace_to_watch", "kubeflow", "Namespace to watch.")
+	flag.StringVar(&params.dbProviderEnabled, "db_credential_provider_enabled", "", "Obtain the database password from a credential provider instead of --db_password. Accepts true or false.")
+	flag.StringVar(&params.dbCredentialProvider, "db_credential_provider", "", "Which credential provider supplies the password. Required when --db_credential_provider_enabled is set.")
+	flag.StringVar(&params.dbProviderSettings, "db_credential_provider_settings", "", "Settings for the credential provider, as a JSON object.")
+	flag.StringVar(&params.dbTLSCAPath, "db_tls_ca_path", "", "CA bundle used to verify the database server certificate. Empty leaves the connection unencrypted.")
 	// Use default value of client QPS (5) & burst (10) defined in
 	// k8s.io/client-go/rest/config.go#RESTClientFor
 	flag.Float64Var(&clientParams.QPS, "kube_client_qps", 5, "The maximum QPS to the master from this client.")
@@ -85,6 +98,17 @@ func main() {
 	flag.IntVar(&webhookPort, "listen_port", DefaultWebhookPort, "Port number on which the webhook listens.")
 
 	flag.Parse()
+
+	// The value reaches argv from a ConfigMap, so it can be empty or an
+	// unexpanded $(VAR) reference when the key is absent. flag.BoolVar would
+	// exit before main runs on either, where the sibling string flags degrade,
+	// so it is parsed here instead.
+	if raw := strings.TrimSpace(params.dbProviderEnabled); raw != "" {
+		if _, err := strconv.ParseBool(raw); err != nil {
+			log.Printf("Ignoring --db_credential_provider_enabled=%q: %v", raw, err)
+			params.dbProviderEnabled = ""
+		}
+	}
 
 	log.Println("Initing client manager....")
 	clientManager := NewClientManager(params, clientParams)

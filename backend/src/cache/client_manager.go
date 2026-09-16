@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -27,6 +28,7 @@ import (
 	"github.com/kubeflow/pipelines/backend/src/cache/client"
 	"github.com/kubeflow/pipelines/backend/src/cache/model"
 	"github.com/kubeflow/pipelines/backend/src/cache/storage"
+	"github.com/kubeflow/pipelines/backend/src/common/dbcreds"
 	"github.com/kubeflow/pipelines/backend/src/common/util"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -72,18 +74,33 @@ func (c *ClientManager) init(params WhSvrDBParameters, clientParams util.ClientP
 
 func initDBClient(params WhSvrDBParameters, initConnectionTimeout time.Duration) *storage.DB {
 	driverName := params.dbDriver
-	var arg string
+	settings := dbSettings(params)
+	util.TerminateIfError(settings.Validate())
+	if warning := settings.IgnoredTLSWarning(); warning != "" {
+		log.Print(warning)
+	}
+	// The standard logger, not glog: the cache server's entrypoint passes no
+	// -logtostderr, and glog writes only ERROR and above to stderr.
+	log.Print(settings.Describe(params.dbDriver))
 
-	switch driverName {
-	case mysqlDBDriverDefault:
-		arg = initMysql(params, initConnectionTimeout)
-	default:
-		glog.Fatalf("Driver %v is not supported", driverName)
+	var dialector gorm.Dialector
+	if settings.Enabled {
+		dialector = initMysqlWithProvider(params, initConnectionTimeout)
+	} else {
+		var arg string
+
+		switch driverName {
+		case mysqlDBDriverDefault:
+			arg = initMysql(params, initConnectionTimeout)
+		default:
+			glog.Fatalf("Driver %v is not supported", driverName)
+		}
+		dialector = mysql.Open(arg)
 	}
 
 	// db is safe for concurrent use by multiple goroutines
 	// and maintains its own pool of idle connections.
-	db, err := gorm.Open(mysql.Open(arg), &gorm.Config{})
+	db, err := gorm.Open(dialector, &gorm.Config{})
 	util.TerminateIfError(err)
 
 	// Create table
@@ -174,6 +191,95 @@ func initMysql(params WhSvrDBParameters, initConnectionTimeout time.Duration) st
 	// Config reference: https://github.com/go-sql-driver/mysql#clientfoundrows
 	mysqlConfig.ClientFoundRows = true
 	return mysqlConfig.FormatDSN()
+}
+
+// dbSettings resolves the credential-provider configuration from flags.
+// Everything after this point is shared with the API server.
+func dbSettings(params WhSvrDBParameters) dbcreds.Settings {
+	return dbcreds.Settings{
+		Enabled:          dbcreds.ParseEnabled(params.dbProviderEnabled),
+		ProviderName:     params.dbCredentialProvider,
+		Password:         params.dbPwd,
+		CABundlePath:     params.dbTLSCAPath,
+		ProviderSettings: params.dbProviderSettings,
+	}
+}
+
+// initMysqlWithProvider is the opt-in counterpart of initMysql. It obtains the
+// connection from a credential provider, which allows a credential that is
+// regenerated per connection and a verified TLS connection.
+func initMysqlWithProvider(params WhSvrDBParameters, initConnectionTimeout time.Duration) gorm.Dialector {
+	if params.dbDriver != mysqlDBDriverDefault {
+		glog.Fatalf("Driver %v is not supported", params.dbDriver)
+	}
+
+	settings := dbSettings(params)
+	provider, err := settings.NewProvider()
+	util.TerminateIfError(err)
+	if warning := settings.IgnoredPasswordWarning(); warning != "" {
+		log.Print(warning)
+	}
+
+	target := mysqlTargetFromParams(params)
+	ctx := context.Background()
+
+	// The bootstrap connection names no database, because the database may not
+	// exist yet.
+	bootstrap, err := dbcreds.Open(ctx, provider, target)
+	util.TerminateIfError(err)
+	defer bootstrap.Close()
+
+	warning, err := dbcreds.EnsureDatabase(params.dbName, initConnectionTimeout,
+		func() error {
+			_, execErr := bootstrap.Exec(fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", params.dbName))
+			return execErr
+		},
+		// IF NOT EXISTS already suppresses the "database exists" error.
+		func(err error) error { return err },
+		func() error { return dbcreds.Probe(ctx, provider, target, params.dbName) })
+	util.TerminateIfError(err)
+	if warning != "" {
+		log.Print(warning)
+	}
+
+	target.DBName = params.dbName
+	// When updating, return rows matched instead of rows affected. This counts rows that are being
+	// set as the same values as before. If updating using a primary key and rows matched is 0, then
+	// it means this row is not found.
+	// Config reference: https://github.com/go-sql-driver/mysql#clientfoundrows
+	target.Params["clientFoundRows"] = "true"
+
+	db, err := dbcreds.Open(ctx, provider, target)
+	util.TerminateIfError(err)
+	return mysql.New(mysql.Config{Conn: db})
+}
+
+// mysqlTargetFromParams describes the MySQL endpoint to connect to. The
+// resulting parameters match those the cache server has always used, so the
+// connection is configured identically whichever provider supplies the
+// credential.
+func mysqlTargetFromParams(params WhSvrDBParameters) dbcreds.Target {
+	connectionParams := map[string]string{
+		"group_concat_max_len": params.dbGroupConcatMaxLen,
+	}
+	if params.dbExtraParams != "" {
+		extraParams := map[string]string{}
+		if err := json.Unmarshal([]byte(params.dbExtraParams), &extraParams); err != nil {
+			log.Printf("Ignoring --db_extra_params because it is not a JSON object: %v", err)
+		}
+		for key, value := range extraParams {
+			connectionParams[key] = value
+		}
+	}
+
+	return dbcreds.Target{
+		Driver: dbcreds.DriverMySQL,
+		Host:   params.dbHost,
+		Port:   params.dbPort,
+		User:   params.dbUser,
+		Params: connectionParams,
+		TLS:    dbSettings(params).TLSOptions(),
+	}
 }
 
 func NewClientManager(params WhSvrDBParameters, clientParams util.ClientParameters) ClientManager {
