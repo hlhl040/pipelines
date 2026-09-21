@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +46,7 @@ import (
 	"github.com/kubeflow/pipelines/backend/src/apiserver/resource"
 	"github.com/kubeflow/pipelines/backend/src/apiserver/storage"
 	"github.com/kubeflow/pipelines/backend/src/apiserver/validation"
+	"github.com/kubeflow/pipelines/backend/src/common/dbcreds"
 	"github.com/kubeflow/pipelines/backend/src/common/util"
 	k8sapi "github.com/kubeflow/pipelines/backend/src/crd/kubernetes/v2beta1"
 	"gorm.io/driver/mysql"
@@ -506,20 +508,34 @@ func InitDBClient(initConnectionTimeout time.Duration) (*sql.DB, sqldrv.DBDialec
 	// 1) To use MySQL, use `mysql`
 	// 2) To use PostgreSQL, use `pgx`
 	driverName := common.GetStringConfig("DBDriverName")
-	arg := initDBDriver(driverName, initConnectionTimeout)
+
+	settings := dbSettings()
+	util.TerminateIfError(settings.Validate())
+	if warning := settings.IgnoredProviderWarning(); warning != "" {
+		glog.Warning(warning)
+	}
+	if warning := settings.IgnoredTLSWarning(); warning != "" {
+		glog.Warning(warning)
+	}
+	glog.Info(settings.Describe(driverName))
 
 	var dialector gorm.Dialector
-	switch driverName {
-	case "mysql":
-		// DefaultStringSize dictates non-indexable string fields map to VARCHAR(255) for backward compatibility with GORM v1.
-		dialector = mysql.New(mysql.Config{
-			DSN:               arg,
-			DefaultStringSize: 255,
-		})
-	case "pgx":
-		dialector = postgres.Open(arg)
-	default:
-		glog.Fatalf("Unsupported driver %v", driverName)
+	if settings.Enabled {
+		dialector = initDBDriverWithProvider(driverName, settings, initConnectionTimeout)
+	} else {
+		arg := initDBDriver(driverName, initConnectionTimeout)
+		switch driverName {
+		case "mysql":
+			// DefaultStringSize dictates non-indexable string fields map to VARCHAR(255) for backward compatibility with GORM v1.
+			dialector = mysql.New(mysql.Config{
+				DSN:               arg,
+				DefaultStringSize: 255,
+			})
+		case "pgx":
+			dialector = postgres.Open(arg)
+		default:
+			glog.Fatalf("Unsupported driver %v", driverName)
+		}
 	}
 
 	// db is safe for concurrent use by multiple goroutines
@@ -630,23 +646,32 @@ func initDBDriver(driverName string, initConnectionTimeout time.Duration) string
 	defer db.Close()
 	util.TerminateIfError(err)
 
-	// Create database if not exist
+	// Create database if not exist.
 	// TODO:1.Move DB creation out of the client manager and into the deployment/init phase (i.e. add a manifests/kustomize/third-party/postgresql/base/pg-init-configmap.yaml)
 	// 2.Introduce a dedicated restricted user for KFP components, limited to the mlpipeline database
 	// Refer to manifests/kustomize/third-party/postgresql/base/pg-secret.yaml
+	//
+	// This is the one place where the pre-provider path does not behave exactly
+	// as it did: a CREATE DATABASE refused for lack of privilege used to retry
+	// until the timeout and then terminate, and now starts the server with a
+	// warning when the database turns out to exist and be reachable. The
+	// database user that cannot create databases is not specific to credential
+	// providers -- a pre-provisioned schema and a least-privilege user are how
+	// any managed database is usually run -- so the two paths share the
+	// behavior rather than making it a reward for opting in. Every other
+	// failure still terminates, as it did.
 	drvDialect := sqldrv.NewDBDialect(driverName)
-	operation = func() error {
-		_, err = db.Exec(fmt.Sprintf("CREATE DATABASE %s", drvDialect.QuoteIdentifier(dbName)))
-		if ignoreAlreadyExistError(drvDialect, err) != nil {
-			return err
-		}
-		return nil
+	warning, ensureErr := dbcreds.EnsureDatabase(dbName, initConnectionTimeout,
+		func() error {
+			_, execErr := db.Exec(fmt.Sprintf("CREATE DATABASE %s", drvDialect.QuoteIdentifier(dbName)))
+			return execErr
+		},
+		func(err error) error { return ignoreAlreadyExistError(drvDialect, err) },
+		func() error { return probeDatabase(driverName, targetDataSourceName(driverName, mysqlConfig, dbName)) })
+	util.TerminateIfError(ensureErr)
+	if warning != "" {
+		glog.Warning(warning)
 	}
-	b = backoff.NewExponentialBackOff()
-	b.MaxElapsedTime = initConnectionTimeout
-	err = backoff.Retry(operation, b)
-
-	util.TerminateIfError(err)
 
 	switch driverName {
 	case "mysql":
@@ -660,22 +685,150 @@ func initDBDriver(driverName string, initConnectionTimeout time.Duration) string
 	case "pgx":
 		// Note: postgreSQL does not have the option `ClientFoundRows`
 		// Config reference: https://www.postgresql.org/docs/current/libpq-connect.html
-		pgxCfg, _, pgxCfgErr := commonsql.CreatePostgreSQLConfig(
-			common.GetStringConfigWithDefault(postgresUser, "user"),
-			common.GetStringConfigWithDefault(postgresPassword, "password"),
-			common.GetStringConfigWithDefault(postgresHost, "postgresql"),
-			dbName,
-			uint16(common.GetIntConfigWithDefault(postgresPort, 5432)),
-			common.GetMapConfig(postgresExtraParams),
-		)
-		if pgxCfgErr != nil {
-			glog.Fatalf("Failed to create PostgreSQL config: %v", pgxCfgErr)
-		}
-		sqlConfig = pgxCfg.ConnString()
+		sqlConfig = postgresDataSourceName(dbName)
 	default:
 		glog.Fatalf("Driver %v is not supported, use \"mysql\" for MySQL, or \"pgx\" for PostgreSQL", driverName)
 	}
 	return sqlConfig
+}
+
+// dbSettings resolves the credential-provider configuration from viper.
+// Everything after this point is shared with the cache server.
+func dbSettings() dbcreds.Settings {
+	return dbcreds.Settings{
+		Enabled:          common.GetDBCredentialProviderEnabled(),
+		ProviderName:     common.GetDBCredentialProvider(),
+		CABundlePath:     common.GetDBTLSCAPath(),
+		ProviderSettings: common.GetDBCredentialProviderSettings(),
+	}
+}
+
+// initDBDriverWithProvider is the opt-in counterpart of initDBDriver. It obtains
+// the connection from a credential provider, which allows a credential that is
+// regenerated per connection and a verified TLS connection.
+func initDBDriverWithProvider(driverName string, settings dbcreds.Settings, initConnectionTimeout time.Duration) gorm.Dialector {
+	switch driverName {
+	case dbcreds.DriverMySQL:
+		return initMySQLDriverWithProvider(settings, initConnectionTimeout)
+	case dbcreds.DriverPostgreSQL:
+		return initPostgreSQLDriverWithProvider(settings, initConnectionTimeout)
+	default:
+		glog.Fatalf("Driver %v is not supported, use \"mysql\" for MySQL, or \"pgx\" for PostgreSQL", driverName)
+		return nil
+	}
+}
+
+func initMySQLDriverWithProvider(settings dbcreds.Settings, initConnectionTimeout time.Duration) gorm.Dialector {
+	dbName := common.GetStringConfig(mysqlDBName)
+	provider, ctx := newDBCredentialProvider(settings, common.GetStringConfigWithDefault(mysqlPassword, ""))
+	target := mysqlTargetFromConfig(settings)
+
+	// The bootstrap connection names no database, because the database may not
+	// exist yet.
+	bootstrap, err := dbcreds.Open(ctx, provider, target)
+	util.TerminateIfError(err)
+	defer bootstrap.Close()
+	prepareDatabaseWithProvider(ctx, bootstrap, provider, target, dbName, sqldrv.NewDBDialect(dbcreds.DriverMySQL), initConnectionTimeout)
+
+	target.DBName = dbName
+	// When updating, return rows matched instead of rows affected. This counts rows that are being
+	// set as the same values as before. If updating using a primary key and rows matched is 0, then
+	// it means this row is not found.
+	// Config reference: https://github.com/go-sql-driver/mysql#clientfoundrows
+	target.Params["clientFoundRows"] = "true"
+
+	db, err := dbcreds.Open(ctx, provider, target)
+	util.TerminateIfError(err)
+	// DefaultStringSize dictates non-indexable string fields map to VARCHAR(255) for backward compatibility with GORM v1.
+	return mysql.New(mysql.Config{Conn: db, DefaultStringSize: 255})
+}
+
+func initPostgreSQLDriverWithProvider(settings dbcreds.Settings, initConnectionTimeout time.Duration) gorm.Dialector {
+	dbName := common.GetStringConfig(postgresDBName)
+	provider, ctx := newDBCredentialProvider(settings, common.GetStringConfigWithDefault(postgresPassword, ""))
+	target := postgresTargetFromConfig(settings)
+
+	// PostgreSQL has no connectionless state, so the bootstrap connection uses
+	// the maintenance database to create the application one.
+	target.DBName = "postgres"
+	bootstrap, err := dbcreds.Open(ctx, provider, target)
+	util.TerminateIfError(err)
+	defer bootstrap.Close()
+	prepareDatabaseWithProvider(ctx, bootstrap, provider, target, dbName, sqldrv.NewDBDialect(dbcreds.DriverPostgreSQL), initConnectionTimeout)
+
+	target.DBName = dbName
+	db, err := dbcreds.Open(ctx, provider, target)
+	util.TerminateIfError(err)
+	return postgres.New(postgres.Config{Conn: db})
+}
+
+// mysqlTargetFromConfig describes the MySQL endpoint to connect to. The
+// resulting parameters match those the API server has always used, so the
+// connection is configured identically whichever provider supplies the
+// credential.
+func mysqlTargetFromConfig(settings dbcreds.Settings) dbcreds.Target {
+	params := map[string]string{
+		"group_concat_max_len": common.GetStringConfigWithDefault(mysqlGroupConcatMaxLen, "1024"),
+	}
+	for key, value := range common.GetMapConfig(mysqlExtraParams) {
+		params[key] = value
+	}
+
+	return dbcreds.Target{
+		Driver: dbcreds.DriverMySQL,
+		Host:   common.GetStringConfigWithDefault(mysqlServiceHost, "mysql"),
+		Port:   common.GetStringConfigWithDefault(mysqlServicePort, "3306"),
+		User:   common.GetStringConfigWithDefault(mysqlUser, "root"),
+		Params: params,
+		TLS:    settings.TLSOptions(),
+	}
+}
+
+// postgresTargetFromConfig describes the PostgreSQL endpoint to connect to.
+func postgresTargetFromConfig(settings dbcreds.Settings) dbcreds.Target {
+	params := map[string]string{}
+	for key, value := range common.GetMapConfig(postgresExtraParams) {
+		params[key] = value
+	}
+
+	return dbcreds.Target{
+		Driver: dbcreds.DriverPostgreSQL,
+		Host:   common.GetStringConfigWithDefault(postgresHost, "postgresql"),
+		Port:   strconv.Itoa(common.GetIntConfigWithDefault(postgresPort, 5432)),
+		User:   common.GetStringConfigWithDefault(postgresUser, "user"),
+		Params: params,
+		TLS:    settings.TLSOptions(),
+	}
+}
+
+// newDBCredentialProvider builds the configured provider and reports a password
+// that will not be used. The password is the caller's, because which one
+// applies depends on the engine it has already resolved.
+func newDBCredentialProvider(settings dbcreds.Settings, password string) (dbcreds.Provider, context.Context) {
+	if warning := settings.IgnoredPasswordWarning(password); warning != "" {
+		glog.Warning(warning)
+	}
+
+	provider, err := settings.NewProvider(password)
+	util.TerminateIfError(err)
+	return provider, context.Background()
+}
+
+// prepareDatabaseWithProvider creates the database if it does not already exist,
+// accepting one that exists but cannot be created. Retrying is also what waits
+// for the server to accept connections, because sql.Open does not dial.
+func prepareDatabaseWithProvider(ctx context.Context, bootstrap *sql.DB, provider dbcreds.Provider, target dbcreds.Target, dbName string, dialect sqldrv.DBDialect, initConnectionTimeout time.Duration) {
+	warning, err := dbcreds.EnsureDatabase(dbName, initConnectionTimeout,
+		func() error {
+			_, execErr := bootstrap.Exec(fmt.Sprintf("CREATE DATABASE %s", dialect.QuoteIdentifier(dbName)))
+			return execErr
+		},
+		func(err error) error { return ignoreAlreadyExistError(dialect, err) },
+		func() error { return dbcreds.Probe(ctx, provider, target, dbName) })
+	util.TerminateIfError(err)
+	if warning != "" {
+		glog.Warning(warning)
+	}
 }
 
 func isLegacySchema(db *gorm.DB) (bool, error) {
@@ -1817,6 +1970,49 @@ func backfillExperimentIDToRunTable(db *gorm.DB) error {
 	return err
 }
 
+// postgresDataSourceName builds the connection string for the application
+// database. The probe shares it so that it authenticates as the same principal
+// as the connection it vouches for; a probe using different credentials would
+// either mask a real failure or manufacture one.
+func postgresDataSourceName(dbName string) string {
+	config, _, err := commonsql.CreatePostgreSQLConfig(
+		common.GetStringConfigWithDefault(postgresUser, "user"),
+		common.GetStringConfigWithDefault(postgresPassword, "password"),
+		common.GetStringConfigWithDefault(postgresHost, "postgresql"),
+		dbName,
+		uint16(common.GetIntConfigWithDefault(postgresPort, 5432)),
+		common.GetMapConfig(postgresExtraParams),
+	)
+	if err != nil {
+		glog.Fatalf("Failed to create PostgreSQL config: %v", err)
+	}
+	return config.ConnString()
+}
+
+// targetDataSourceName builds a connection string that names the target
+// database, which is what the probe needs: the bootstrap connection deliberately
+// does not name one, because the database may not exist yet.
+func targetDataSourceName(driverName string, mysqlConfig *mysqlStd.Config, dbName string) string {
+	if driverName == "mysql" {
+		probeConfig := mysqlConfig.Clone()
+		probeConfig.DBName = dbName
+		return probeConfig.FormatDSN()
+	}
+	return postgresDataSourceName(dbName)
+}
+
+// probeDatabase reports whether the target database exists and is usable.
+func probeDatabase(driverName, dataSourceName string) error {
+	db, err := sql.Open(driverName, dataSourceName)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return db.Ping()
+}
+
+// Returns the same error, if it's not "already exists" related.
+// Otherwise, return nil.
 func ignoreAlreadyExistError(dialect sqldrv.DBDialect, err error) error {
 	if err == nil || dialect.IsDuplicateDatabaseError(err) {
 		return nil

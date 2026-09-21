@@ -92,5 +92,13 @@ spec:
             - "--db_user=$(DBCONFIG_POSTGRESQLCONFIG_USER)"
             - "--db_password=$(DBCONFIG_POSTGRESQLCONFIG_PASSWORD)"
             - "--db_extra_params=$(DBCONFIG_POSTGRESQLCONFIG_EXTRAPARAMS)"
+            # args is replaced wholesale by this patch, so the credential
+            # provider flags the base deployment passes have to be repeated
+            # here. The environment variables they read come from the base and
+            # survive the patch.
+            - "--db_credential_provider_enabled=$(DB_CREDENTIAL_PROVIDER_ENABLED)"
+            - "--db_credential_provider=$(DB_CREDENTIAL_PROVIDER)"
+            - "--db_credential_provider_settings=$(DB_CREDENTIAL_PROVIDER_SETTINGS)"
+            - "--db_tls_ca_path=$(DB_TLS_CA_PATH)"
             - "--namespace_to_watch=$(NAMESPACE_TO_WATCH)"
             - "--listen_port=$(WEBHOOK_PORT)"

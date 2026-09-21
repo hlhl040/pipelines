@@ -21,8 +21,12 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 
 	"github.com/kubeflow/pipelines/backend/src/cache/server"
+	_ "github.com/kubeflow/pipelines/backend/src/common/dbcreds/all"
 	"github.com/kubeflow/pipelines/backend/src/common/util"
 )
 
@@ -60,6 +64,12 @@ type WhSvrDBParameters struct {
 	dbGroupConcatMaxLen string
 	dbExtraParams       string
 	namespaceToWatch    string
+
+	// dbProviderEnabled holds the raw flag value; dbcreds.ParseEnabled reads it.
+	dbProviderEnabled    string
+	dbCredentialProvider string
+	dbProviderSettings   string
+	dbTLSCAPath          string
 }
 
 func main() {
@@ -78,6 +88,10 @@ func main() {
 	flag.StringVar(&params.dbGroupConcatMaxLen, "db_group_concat_max_len", mysqlDBGroupConcatMaxLenDefault, "Database group concat max length (MySQL only).")
 	flag.StringVar(&params.dbExtraParams, "db_extra_params", "", "Database extra parameters.")
 	flag.StringVar(&params.namespaceToWatch, "namespace_to_watch", "kubeflow", "Namespace to watch.")
+	flag.StringVar(&params.dbProviderEnabled, "db_credential_provider_enabled", "", "Obtain the database password from a credential provider instead of --db_password. Accepts true or false.")
+	flag.StringVar(&params.dbCredentialProvider, "db_credential_provider", "", "Which credential provider supplies the password. Required when --db_credential_provider_enabled is set.")
+	flag.StringVar(&params.dbProviderSettings, "db_credential_provider_settings", "", "Settings for the credential provider, as a JSON object.")
+	flag.StringVar(&params.dbTLSCAPath, "db_tls_ca_path", "", "CA bundle used to verify the database server certificate. Empty leaves the connection unencrypted.")
 	// Use default value of client QPS (5) & burst (10) defined in
 	// k8s.io/client-go/rest/config.go#RESTClientFor
 	flag.Float64Var(&clientParams.QPS, "kube_client_qps", 5, "The maximum QPS to the master from this client.")
@@ -89,6 +103,38 @@ func main() {
 	flag.IntVar(&webhookPort, "listen_port", DefaultWebhookPort, "Port number on which the webhook listens.")
 
 	flag.Parse()
+
+	// These reach argv from a ConfigMap, so each can arrive empty or as an
+	// unexpanded $(VAR) reference: Kubernetes leaves the reference in place when
+	// the variable is not defined, which is what an installation whose
+	// ConfigMap predates these keys produces. Discard it, so an absent key reads
+	// as unset rather than as its own placeholder -- otherwise a CA bundle path
+	// of "$(DB_TLS_CA_PATH)" is a configured value, and the operator is told
+	// their bundle is being ignored when they never set one.
+	//
+	// One list rather than an assignment each, so that a flag added below is
+	// added here too: a missing line does not fail, it just reinstates the bug.
+	for _, flagValue := range []struct {
+		name  string
+		value *string
+	}{
+		{"db_credential_provider_enabled", &params.dbProviderEnabled},
+		{"db_credential_provider", &params.dbCredentialProvider},
+		{"db_credential_provider_settings", &params.dbProviderSettings},
+		{"db_tls_ca_path", &params.dbTLSCAPath},
+	} {
+		*flagValue.value = discardUnexpanded(flagValue.name, *flagValue.value)
+	}
+
+	// The switch is parsed here rather than declared with flag.BoolVar, which
+	// would exit before main runs on an empty value, where the sibling string
+	// flags degrade.
+	if raw := strings.TrimSpace(params.dbProviderEnabled); raw != "" {
+		if _, err := strconv.ParseBool(raw); err != nil {
+			log.Printf("Ignoring --db_credential_provider_enabled=%q: %v", raw, err)
+			params.dbProviderEnabled = ""
+		}
+	}
 
 	// Validate db_driver before using it to set defaults.
 	switch params.dbDriver {
@@ -139,4 +185,18 @@ func main() {
 		Handler: mux,
 	}
 	log.Fatal(server.ListenAndServeTLS(certPath, keyPath))
+}
+
+// unexpandedReference matches an environment variable reference that Kubernetes
+// left in argv because the variable is not defined.
+var unexpandedReference = regexp.MustCompile(`^\$\([A-Za-z_][A-Za-z0-9_]*\)$`)
+
+// discardUnexpanded returns an empty string for such a reference, so that a
+// ConfigMap key which does not exist is indistinguishable from one left blank.
+func discardUnexpanded(flagName, value string) string {
+	if !unexpandedReference.MatchString(strings.TrimSpace(value)) {
+		return value
+	}
+	log.Printf("Ignoring --%s=%q: the ConfigMap key it reads is not set", flagName, value)
+	return ""
 }

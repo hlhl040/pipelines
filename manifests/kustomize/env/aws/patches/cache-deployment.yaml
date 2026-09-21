@@ -1,0 +1,25 @@
+# Mount the database CA bundle so the cache server can verify the RDS server
+# certificate.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cache-server
+spec:
+  template:
+    spec:
+      containers:
+      - name: server
+        env:
+        - name: DBCONFIG_USER
+          valueFrom:
+            secretKeyRef:
+              name: kfp-db-users
+              key: cacheUser
+        volumeMounts:
+        - name: db-ca-bundle
+          mountPath: /etc/db-tls
+          readOnly: true
+      volumes:
+      - name: db-ca-bundle
+        configMap:
+          name: db-ca-bundle
